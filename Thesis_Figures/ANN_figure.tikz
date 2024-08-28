@@ -1,0 +1,81 @@
+\documentclass{standalone}
+\usepackage{tikz}
+\usepackage{xcolor}
+\definecolor{C1}{HTML}{e60049}
+\definecolor{C2}{HTML}{0bb4ff}
+\definecolor{C3}{HTML}{50e991}
+
+
+\usetikzlibrary{positioning}
+
+\begin{document}
+
+\begin{tikzpicture}[shorten >=1pt,->,draw=black!50, node distance=1.5cm]
+    % Input Layer
+    \node[draw,circle,fill=C3,minimum size=0.9cm] (I1) at (0,2) {};
+    \node[draw,circle,fill=C3,minimum size=0.9cm] (I2) at (0,1) {};
+    \node[draw,circle,fill=C3,minimum size=0.9cm] (I3) at (0,0) {};
+    \node[scale=1.5,text=C3] (Dots) at (0,-0.75) {$\vdots$};
+    \node[draw,circle,fill=C3,minimum size=0.9cm] (In) at (0,-1.5) {};
+
+    % Arrows with x_i labels
+    \foreach \i/\y in {1/2, 2/1, 3/0, n/-1.5}
+    {
+        \node (X\i) at (-1.5,\y) {};
+        \draw[->] (X\i) -- (I\i.west);
+        \node at (-1,\y+0.2) {$x_{\i}$};
+    }
+
+    % Layer H1 at x = 3 (filled with red color)
+    \node[draw,circle,fill=C2,minimum size=0.9cm] (H1) at (3,2.5) {};
+    \node[draw,circle,fill=C2,minimum size=0.9cm] (H2) at (3,1.5) {};
+    \node[draw,circle,fill=C2,minimum size=0.9cm] (H3) at (3,0.5) {};
+    \node[draw,circle,fill=C2,minimum size=0.9cm] (H4) at (3,-0.5) {};
+    \node[scale=1.5,text=C2] (HDots1) at (3,-1.25) {$\vdots$};
+    \node[draw,circle,fill=C2,minimum size=0.9cm] (Hn1) at (3,-2) {};
+    
+    % Layer H2 at x = 5.5 (filled with red color)
+    \node[draw,circle,fill=C2,minimum size=0.9cm] (H1b) at (5.5,2.5) {};
+    \node[draw,circle,fill=C2,minimum size=0.9cm] (H2b) at (5.5,1.5) {};
+    \node[draw,circle,fill=C2,minimum size=0.9cm] (H3b) at (5.5,0.5) {};
+    \node[draw,circle,fill=C2,minimum size=0.9cm] (H4b) at (5.5,-0.5) {};
+    \node[scale=1.5,text=C2] (HDots2) at (5.5,-1.25) {$\vdots$};
+    \node[draw,circle,fill=C2,minimum size=0.9cm] (Hn2) at (5.5,-2) {};
+
+    % Output Layer at x = 8
+    \node[draw,circle,fill=C1,minimum size=0.9cm] (O1) at (8,0.75) {};
+    \node[scale=1.5,text=C1] (ODots) at (8,-0) {$\vdots$};
+    \node[draw,circle,fill=C1,minimum size=0.9cm] (Om) at (8,-0.75) {};
+
+    % Writing of Layers
+    \node[scale=1.125,text=C3] (Input) at (0,3.5){Input Layer};
+    \node[scale=1.125,text=C2] (Input) at (4.2,3.5){Hidden Layers};
+    \node[scale=1.125,text=C1] (Input) at (8,3.5){Output Layer};
+
+
+    % Arrows with y_i labels
+    \foreach \i/\y in {1/0.75, m/-0.75}
+    {
+        \node (y\i) at (9.5,\y) {};
+        \draw[->] (O\i.east) -- (y\i.west);
+        \node at (9,\y+0.2) {$y_{\i}$};
+    }
+
+    % Connections: Input to H1
+    \foreach \i in {1,2,3,n}
+        \foreach \j in {1,2,3,4,n1}
+            \draw[->] (I\i) -- (H\j);
+
+    % Connections: H1 to H2
+    \foreach \i in {1,2,3,4,n1}
+        \foreach \j in {1b,2b,3b,4b,n2}
+            \draw[->] (H\i) -- (H\j);
+
+    % Connections: H2 to Output
+    \foreach \i in {1b,2b,3b,4b,n2}
+        \foreach \j in {O1,Om}
+            \draw[->] (H\i) -- (\j);
+
+\end{tikzpicture}
+
+\end{document}

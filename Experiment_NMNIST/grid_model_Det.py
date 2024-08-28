@@ -1,0 +1,296 @@
+import json
+import os
+import time
+import torch
+import torch.nn as nn
+import torch.utils.data as data
+import numpy as np
+import matplotlib.pyplot as plt
+from torch import tensor
+from torch.distributions import Bernoulli, RelaxedBernoulli
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
+import tonic
+import tonic.transforms as transforms
+from tonic import DiskCachedDataset
+import snntorch as snn
+import pickle
+
+dtype = torch.float
+
+os.chdir('Experiment_NMNIST')
+
+'''
+HyperParameters For Net:
+    General:
+        - Device: Device to run the model on
+    Net:
+        - num_steps: Number of time steps to run the model for
+        - lr: Learning rate for the optimizer
+        - loss: Loss function to use
+        - num_epochs: Number of epochs to train for
+        - train_loader: Data loader for the training data
+        - test_loader: Data loader for the test data
+
+'''
+
+# Parameters
+beta = 0.9
+thresholds = [0.5, 1.5, 4.5]
+timestep = 30
+num_epochs = 200
+batch_size = 128
+learning_rate = 0.001
+surrogate_value = 1.0
+
+for threshold in thresholds:
+
+    def set_seed(seed):
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)  # if you are using multi-GPU.
+        torch.backends.cudnn.deterministic = True  # ensures deterministic behavior
+        torch.backends.cudnn.benchmark = False     # disables the inbuilt cudnn auto-tuner which can introduce randomness
+
+    set_seed(42)
+
+    from snntorch import surrogate
+
+    def custom_surrogate_rectangle(input_, grad_input, spikes):
+        ## The hyperparameter slope is defined inside the function.
+        a = torch.tensor(surrogate_value)
+        grad = grad_input*(1/torch.sqrt(2*torch.pi*a))*torch.exp(-torch.square(input_)/(2*a))
+        return grad
+
+    spike_grad = surrogate.custom_surrogate(custom_surrogate_rectangle)
+
+
+    class Net(nn.Module):
+        ### Conv net with 12C5 - P2 - 64C5 - P2
+        def __init__(self, beta, device, threshold):
+            super().__init__()
+
+            self.beta = beta
+
+            ## Initialize layers
+            self.Conv_1 = nn.Conv2d(2, 12, 5, bias=False, device=device)
+            self.pool_1 = nn.AvgPool2d(2)
+            self.LiF_1 = snn.Leaky(self.beta, threshold=threshold, spike_grad = spike_grad)
+
+
+            self.Conv_2 = nn.Conv2d(12, 64, 5, bias=False, device=device)
+            self.pool_2 = nn.AvgPool2d(2)
+            self.LiF_2 = snn.Leaky(self.beta, threshold=threshold, spike_grad = spike_grad)
+
+            self.Flatten = nn.Flatten()
+            self.FC = nn.Linear(1600, 10, bias = False, device = device)
+            self.LiF_3 = snn.Leaky(self.beta, threshold=threshold, spike_grad = spike_grad)
+
+        def forward(self, input): ## Note here input is [Time, Batch, Shape]
+            num_steps = input.shape[0]
+            batch_size = input.shape[1]
+
+            ## initialize hidden states (membranes)
+            mem1 = self.LiF_1.init_leaky()
+            mem2 = self.LiF_2.init_leaky()
+            mem3 = self.LiF_3.init_leaky()
+
+            out_sum_spike = torch.zeros(batch_size, 10, device=device) ## 10 classes
+            
+            # Record the final layer
+            spk3_rec = []
+            mem3_rec = []
+
+
+            for step in range(num_steps):
+                x = input[step]
+                cur_1 = self.Conv_1(x)
+                cur_1 = self.pool_1(cur_1)
+                spk1, mem1 = self.LiF_1.forward(cur_1, mem1)
+
+                cur_2 = self.Conv_2(spk1)
+                cur_2 = self.pool_2(cur_2)
+                spk2, mem2 = self.LiF_2.forward(cur_2, mem2)
+
+                cur_3 = self.FC(self.Flatten(spk2))
+                spk3, mem3 = self.LiF_3.forward(cur_3, mem3)
+
+                spk3_rec.append(spk3)
+                mem3_rec.append(mem3)
+                out_sum_spike += spk3
+
+            out_sum_spike = out_sum_spike/num_steps
+            
+            return out_sum_spike, torch.stack(spk3_rec, dim=0), torch.stack(mem3_rec, dim=0) ## return spike train and final membrane history
+
+
+
+    def trainer(net, train_loader, test_loader, device, num_epochs, lr, batch_size):### numsteps now defined in train/ testloader
+        loss = nn.MSELoss()
+        optimizer = torch.optim.Adam(net.parameters(), lr = lr, betas = (0.9, 0.999), weight_decay=1e-8)
+        loss_hist = []
+        test_loss_hist = []
+        test_acc_hist = []
+        loss_val = 0
+        counter = 0
+        scaler = torch.cuda.amp.GradScaler()
+        
+        net.train()
+        
+        for data, _ in iter(train_loader):
+            num_steps = data.shape[0]
+            break
+
+        for epoch in range(num_epochs):
+            iter_counter = 0
+            epoch_loss_hist = []
+            epoch_test_loss_hist = []
+            t = time.time()
+
+            for data, label in iter(train_loader):
+
+                data = data.to(device)
+                targets = torch.nn.functional.one_hot(label, num_classes=10).float().to(device)
+                spike_data = data.to(device)
+
+                # Gradient calculation + weight update
+                optimizer.zero_grad()
+                with torch.cuda.amp.autocast():
+                    output, _, _ = net(spike_data)
+                    loss_val = loss(output, targets)
+                scaler.scale(loss_val).backward()
+                scaler.step(optimizer)
+                scaler.update()
+
+                # Store loss history for future plotting
+                epoch_loss_hist.append(loss_val.item())
+
+            with torch.no_grad():
+                net.eval()
+                total = 0.
+                correct = 0.
+                for test_data, test_targets in iter(test_loader):
+                    test_data = test_data.to(device)
+                    test_targets_oh = torch.nn.functional.one_hot(test_targets, num_classes=10).float().to(device)
+                    test_targets = test_targets.to(device)
+                    test_spike_data = test_data.to(device)
+                
+
+                    # Test set forward pass
+                    test_output, _, _ = net(test_spike_data)
+
+                    # Test set loss
+                    test_loss = loss(test_output, test_targets_oh)
+                    epoch_test_loss_hist.append(test_loss.item())
+
+                    # calculate total accuracy
+                    _, predicted = test_output.max(1)
+                    total += test_targets.size(0)
+                    correct += (predicted == test_targets).sum().item()
+
+            test_acc = 100 * correct / total
+            
+            loss_hist.append(np.mean(epoch_loss_hist))
+            test_loss_hist.append(np.mean(epoch_test_loss_hist))
+            test_acc_hist.append(test_acc)
+            print(f'Train Loss for Epoch {epoch+1} is {np.mean(epoch_loss_hist)}: Test Loss is {np.mean(epoch_test_loss_hist)}: Test ACC is {test_acc}: Epoch Time: {time.time() - t}', flush=True)
+        return loss_hist, test_loss_hist, test_acc_hist
+
+
+
+    def train_and_test(device, train_loader, test_loader, beta, num_epochs, num_steps, batch_size, lr): ### numsteps now defined in train/ testloader
+        print(f'Started training for beta {beta}  time {num_steps}', flush=True)
+        set_seed(42)
+
+        net = Net(beta = beta, threshold=threshold, device = device).to(device) ## Create net
+
+        train_hist, test_hist, test_acc_hist = trainer(net, train_loader, test_loader, num_epochs = num_epochs, device = device, batch_size=batch_size, lr = lr) # train net
+
+        torch.save(net.state_dict(), f'deterministic_model/Models/Det_beta{beta}_num_epochs{num_epochs}_num_steps{num_steps}_batch_size{batch_size}_lr{lr}_thr_{threshold}.pt') ## Save model
+
+        ## Calc test Accuracies
+        total = 0
+        correct = 0
+
+
+        with torch.no_grad():
+            net.eval()
+            for data, targets in test_loader:
+                data = data.to(device)
+                targets = targets.to(device, dtype=torch.float32)
+                test_spike_data = data.to(device)
+
+                # forward pass
+                test_output, _, _ = net(test_spike_data)
+
+                # calculate total accuracy
+                _, predicted = test_output.max(1)
+                total += targets.size(0)
+                correct += (predicted == targets).sum().item()
+
+            test_acc = 100 * correct / total
+
+            result = {
+                'beta': beta,
+                'timestep': num_steps,
+                'test_acc': test_acc,
+                'train_hist': train_hist,
+                'test_hist': test_hist,
+                'test_acc_hist': test_acc_hist
+            }
+
+            # Save plot
+            plt.figure()
+            plt.plot(train_hist, label='Train Hist')
+            plt.plot(test_hist, label='Test Hist')
+            plt.legend()
+            plt.xlabel('Epoch')
+            plt.ylabel('Loss')
+            plt.title(f'Train Hist vs Test Hist (beta={beta}, timestep={num_steps})')
+            plt.savefig(f'deterministic_model/Results/Det_beta{beta}_num_epochs{num_epochs}_num_steps{num_steps}_batch_size{batch_size}_lr{lr}_thr_{threshold}.png')
+            plt.close()
+
+            # Save all results to a file
+            with open(f'deterministic_model/Results/Det_beta{beta}_num_epochs{num_epochs}_num_steps{num_steps}_batch_size{batch_size}_lr{lr}_thr_{threshold}.pkl', 'wb') as f:
+                pickle.dump(result, f)
+
+        return result
+
+
+
+    ### Train Models
+    device = torch.device('cuda:1')
+
+
+
+    ### Load the Data
+
+    sensor_size = tonic.datasets.NMNIST.sensor_size
+    frame_transform = transforms.Compose([
+                                    transforms.ToFrame(sensor_size=sensor_size,
+                                                        n_time_bins=timestep) 
+                                    ])
+    ### n_time_bins is How many timesteps
+
+    trainset = tonic.datasets.NMNIST(save_to='./data', transform=frame_transform, train=True)
+    testset = tonic.datasets.NMNIST(save_to='./data', transform=frame_transform, train=False)
+
+
+    class BinarizeTransform:
+        def __call__(self, tensor):
+            return (tensor > 0).float()
+
+    transform = tonic.transforms.Compose([torch.from_numpy,
+                                    BinarizeTransform()])
+
+    cached_trainset = DiskCachedDataset(trainset, transform=transform, cache_path='./cache/nmnist/train')
+    cached_testset = DiskCachedDataset(testset, transform=transform, cache_path='./cache/nmnist/test')
+
+    trainloader = DataLoader(cached_trainset, batch_size=batch_size, collate_fn=tonic.collation.PadTensors(batch_first=False), shuffle=True, drop_last=True)
+    testloader = DataLoader(cached_testset, batch_size=batch_size, collate_fn=tonic.collation.PadTensors(batch_first=False))
+
+    big_t = time.time()
+    train_and_test(device=device, train_loader=trainloader, test_loader=testloader, beta=beta, num_epochs=num_epochs, num_steps=timestep, batch_size=batch_size, lr=learning_rate)
+    print(f'Total Time To Train was {time.time()-big_t}')
+
